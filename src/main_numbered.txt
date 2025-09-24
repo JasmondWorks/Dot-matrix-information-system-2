@@ -1,0 +1,927 @@
+    1 #include <ArduinoJson.h>
+    2 #include <DNSServer.h>
+    3 #include <ESP8266WebServer.h>
+    4 #include <ESP8266WiFi.h>
+    5 #include <ESP.h>
+    6 #include <LittleFS.h>
+    7 #include <WebSocketsServer.h>
+    8 #include <algorithm>
+    9 #include <time.h>
+   10 #include <vector>
+   11 
+   12 // ===== Pins / device state (example) =====
+   13 #define RELAY_PIN D1 // adjust for your board
+   14 bool relayOn = false;
+   15 
+   16 // ===== Networking =====
+   17 const char *AP_SSID = "ESP8266-UI";
+   18 const char *AP_PASS = "esp8266pass"; // 8+ chars recommended
+   19 const IPAddress AP_IP(192, 168, 4, 1);
+   20 const IPAddress AP_GW(192, 168, 4, 1);
+   21 const IPAddress AP_MASK(255, 255, 255, 0);
+   22 // SoftAP tuning
+   23 const uint8_t AP_CHANNEL = 1;  // choose 1, 6 or 11 to avoid overlap
+   24 const uint8_t AP_MAX_CONN = 4; // max stations
+   25 
+   26 // Optional STA creds (non-blocking join). Leave as empty strings to disable.
+   27 const char *STA_SSID = "HOME_SSID";
+   28 const char *STA_PASS = "HOME_PASS";
+   29 
+   30 // ===== Servers =====
+   31 ESP8266WebServer server(80);
+   32 WebSocketsServer ws(81);
+   33 DNSServer dns;
+   34 
+   35 // ===== Wi-Fi credential storage =====
+   36 const char *WIFI_CONFIG_PATH = "/wifi.json";
+   37 String staSsid;
+   38 String staPass;
+   39 bool staPersist = false;
+   40 
+   42   bool dateDisplayEnabled = true;
+   43   bool calendarVisible = true;
+   44   String ledColor = "#FF5A5F";
+   45   String font = "Orbitron";
+   46   bool soundEnabled = true;
+   48 
+   50   String id;
+   51   String title;
+   52   String body;
+   53   String soundFileId;
+   54   bool soundEnabled = false;
+   55   String scrollSpeed;
+   56   String animation;
+   57   int durationSec = 0;
+   58   int numScrolls = 0;
+   59   bool muted = true;
+   60   String createdAt;
+   61   String updatedAt;
+   62   std::vector<String> tags;
+   64 
+   66   String id;
+   67   String messageId;
+   68   std::vector<String> days;
+   69   std::vector<String> specificDates;
+   70   String time;
+   71   String timezone;
+   72   String nextRunAt;
+   73   bool enabled = true;
+   74   String recurrenceSummary;
+   76 
+   78   String id;
+   79   String messageId;
+   80   String title;
+   81   String body;
+   82   String status;
+   83   String createdAt;
+   85 
+   86 DeviceSettingsData deviceSettings;
+   87 std::vector<MessageRecord> messageStore;
+   88 std::vector<ScheduleRecord> scheduleStore;
+   89 std::vector<LogEntry> logEntries;
+   90 
+   91 MessageRecord currentMessage;
+   92 bool hasCurrentMessage = false;
+   93 int currentScrollsDone = 0;
+   94 int currentTimeLeftSec = 0;
+   95 
+   96 const size_t MAX_LOG_ENTRIES = 20;
+   97 const size_t MAX_MESSAGES = 20;
+   98 const size_t MAX_SCHEDULES = 20;
+   99 
+  100 const int CAP_MAX_CHARS = 32;
+  101 const bool CAP_SUPPORTS_SOUND = true;
+  102 const bool CAP_SUPPORTS_MULTI = false;
+  103 
+  104 String deviceName = "PixelSign-01";
+  105 int batteryPercentage = 78;
+  106 
+  107 uint64_t rtcEpochBaseMs = 0;
+  108 uint32_t rtcBaseMillis = 0;
+  109 
+  110 String lastPairingChallenge;
+  111 String deviceToken;
+  112 String claimedUserId;
+  113 
+  114 String deviceId = String(ESP.getChipId(), HEX);
+  115 
+  116 // ===== Helpers =====
+  117 template <typename T>
+  120     return;
+  122   vec.erase(vec.begin(), vec.begin() + (vec.size() - maxSize));
+  124 
+  126   if (day.equalsIgnoreCase("Sun")) return 0;
+  127   if (day.equalsIgnoreCase("Mon")) return 1;
+  128   if (day.equalsIgnoreCase("Tue")) return 2;
+  129   if (day.equalsIgnoreCase("Wed")) return 3;
+  130   if (day.equalsIgnoreCase("Thu")) return 4;
+  131   if (day.equalsIgnoreCase("Fri")) return 5;
+  132   if (day.equalsIgnoreCase("Sat")) return 6;
+  133   return -1;
+  135 
+  138     hour = 0;
+  139     minute = 0;
+  140     return false;
+  142   int sep = value.indexOf(':');
+  144     return false;
+  146   hour = value.substring(0, sep).toInt();
+  147   minute = value.substring(sep + 1).toInt();
+  149     return false;
+  151   return true;
+  153 
+  155   String result;
+  158       result += delimiter;
+  160     result += values[i];
+  162   return result;
+  164 
+  167     return static_cast<uint64_t>(millis());
+  169   uint32_t elapsed = millis() - rtcBaseMillis;
+  170   return rtcEpochBaseMs + static_cast<uint64_t>(elapsed);
+  172 
+  174   time_t seconds = epochMs / 1000ULL;
+  175   struct tm *info = gmtime(&seconds);
+  177     char fallback[24];
+  178     snprintf(fallback, sizeof(fallback), "%llu", static_cast<unsigned long long>(epochMs));
+  179     return String(fallback);
+  181   char buffer[32];
+  182   snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+  183            info->tm_year + 1900, info->tm_mon + 1, info->tm_mday,
+  184            info->tm_hour, info->tm_min, info->tm_sec);
+  185   return String(buffer);
+  187 
+  189   return isoFromEpoch(currentEpochMs());
+  191 
+  193   char buffer[40];
+  194   unsigned long now = millis();
+  195   uint16_t entropy = static_cast<uint16_t>(random(0xFFFF));
+  196   snprintf(buffer, sizeof(buffer), "%s-%lu-%04u", prefix, now, entropy);
+  197   return String(buffer);
+  199 
+  202     return body;
+  204   return body.substring(0, 64);
+  206 
+  209     tags.push_back(tag);
+  212 
+  215     return entry.equalsIgnoreCase(tag);
+  217   tags.erase(it, tags.end());
+  219 
+  221   obj["id"] = msg.id;
+  222   obj["title"] = msg.title;
+  223   obj["body"] = msg.body;
+  225     obj["soundFileId"] = msg.soundFileId;
+  227   obj["soundEnabled"] = msg.soundEnabled;
+  228   obj["scrollSpeed"] = msg.scrollSpeed;
+  229   obj["animation"] = msg.animation;
+  231     obj["durationSec"] = msg.durationSec;
+  234     obj["numScrolls"] = msg.numScrolls;
+  236   obj["muted"] = msg.muted;
+  237   obj["createdAt"] = msg.createdAt;
+  238   obj["updatedAt"] = msg.updatedAt;
+  239   JsonArray tagsArray = obj.createNestedArray("tags");
+  241     tagsArray.add(tag);
+  244 
+  246   obj["id"] = schedule.id;
+  247   obj["messageId"] = schedule.messageId;
+  249     JsonArray daysArray = obj.createNestedArray("days");
+  251       daysArray.add(day);
+  255     JsonArray datesArray = obj.createNestedArray("specificDates");
+  257       datesArray.add(date);
+  261     obj["time"] = schedule.time;
+  264     obj["timezone"] = schedule.timezone;
+  267     obj["nextRunAt"] = schedule.nextRunAt;
+  269   obj["enabled"] = schedule.enabled;
+  271     obj["recurrenceSummary"] = schedule.recurrenceSummary;
+  274 
+  276   obj["dateDisplayEnabled"] = deviceSettings.dateDisplayEnabled;
+  277   obj["calendarVisible"] = deviceSettings.calendarVisible;
+  278   obj["ledColor"] = deviceSettings.ledColor;
+  279   obj["font"] = deviceSettings.font;
+  280   obj["soundEnabled"] = deviceSettings.soundEnabled;
+  282 
+  285     String summary = joinStrings(schedule.specificDates, ", ");
+  287       summary += " at ";
+  288       summary += schedule.time;
+  290     return summary;
+  293     String summary = joinStrings(schedule.days, ", ");
+  295       summary += " at ";
+  296       summary += schedule.time;
+  298     return summary;
+  301     return String("Daily at ") + schedule.time;
+  303   return String("Custom schedule");
+  305 
+  308     String earliest = schedule.specificDates[0];
+  311         earliest = candidate;
+  314     String timePart = schedule.time.length() ? schedule.time : String("00:00");
+  315     schedule.nextRunAt = earliest + "T" + timePart + ":00Z";
+  316     return schedule.nextRunAt;
+  319     uint64_t nowMs = currentEpochMs();
+  320     time_t nowSec = nowMs / 1000ULL;
+  321     struct tm *info = gmtime(&nowSec);
+  323       int currentDow = info->tm_wday;
+  324       int hour = 0;
+  325       int minute = 0;
+  326       timeStringToParts(schedule.time, hour, minute);
+  327       int targetSeconds = hour * 3600 + minute * 60;
+  328       int bestDiff = 8;
+  330         int idx = weekdayIndexFromString(day);
+  332           continue;
+  334         int diff = (idx - currentDow + 7) % 7;
+  336           int nowSeconds = info->tm_hour * 3600 + info->tm_min * 60 + info->tm_sec;
+  338             diff = 7;
+  342           bestDiff = diff;
+  346         uint64_t baseSeconds = (nowSec - (info->tm_hour * 3600 + info->tm_min * 60 + info->tm_sec));
+  347         uint64_t candidateSeconds = baseSeconds + static_cast<uint64_t>(bestDiff) * 86400ULL + targetSeconds;
+  348         schedule.nextRunAt = isoFromEpoch(candidateSeconds * 1000ULL);
+  349         return schedule.nextRunAt;
+  354     uint64_t nowMs = currentEpochMs();
+  355     time_t nowSec = nowMs / 1000ULL;
+  356     struct tm *info = gmtime(&nowSec);
+  358       int hour = 0;
+  359       int minute = 0;
+  360       timeStringToParts(schedule.time, hour, minute);
+  361       uint64_t midnight = nowSec - (info->tm_hour * 3600 + info->tm_min * 60 + info->tm_sec);
+  362       uint64_t candidateSeconds = midnight + static_cast<uint64_t>(hour) * 3600ULL + static_cast<uint64_t>(minute) * 60ULL;
+  364         candidateSeconds += 86400ULL;
+  366       schedule.nextRunAt = isoFromEpoch(candidateSeconds * 1000ULL);
+  367       return schedule.nextRunAt;
+  370   schedule.nextRunAt = "";
+  371   return schedule.nextRunAt;
+  373 
+  375   LogEntry entry;
+  376   entry.id = generateId("log");
+  377   entry.messageId = msg.id;
+  378   entry.title = msg.title;
+  379   entry.body = msg.body;
+  380   entry.status = status;
+  381   entry.createdAt = msg.updatedAt.length() ? msg.updatedAt : isoNow();
+  382   logEntries.push_back(entry);
+  383   clampVectorSize(logEntries, MAX_LOG_ENTRIES);
+  385 
+  388     return existing.id == msg.id;
+  391     *it = msg;
+  393     messageStore.push_back(msg);
+  394     clampVectorSize(messageStore, MAX_MESSAGES);
+  397 
+  400     return existing.id == schedule.id;
+  403     *it = schedule;
+  405     scheduleStore.push_back(schedule);
+  406     clampVectorSize(scheduleStore, MAX_SCHEDULES);
+  409 
+  412     return existing.id == messageId;
+  415     return;
+  418     ensureTagPresent(it->tags, "scheduled");
+  420     removeTag(it->tags, "scheduled");
+  423 
+  425   MessageRecord msg;
+  426   ok = false;
+  428     error = "invalid_message";
+  429     return msg;
+  431   JsonObjectConst obj = source.as<JsonObjectConst>();
+  432   const char *title = obj["title"] | "";
+  433   const char *body = obj["body"] | "";
+  435     error = "missing_fields";
+  436     return msg;
+  438   const char *id = obj["id"] | "";
+  439   msg.id = strlen(id) ? String(id) : generateId("msg");
+  440   msg.title = title;
+  441   msg.body = body;
+  442   const char *soundId = obj["soundFileId"] | "";
+  443   msg.soundFileId = soundId;
+  444   msg.soundEnabled = obj["soundEnabled"] | false;
+  445   msg.scrollSpeed = String(obj["scrollSpeed"] | "normal");
+  446   msg.animation = String(obj["animation"] | "slide");
+  447   msg.durationSec = obj["durationSec"].isNull() ? 0 : obj["durationSec"].as<int>();
+  448   msg.numScrolls = obj["numScrolls"].isNull() ? 0 : obj["numScrolls"].as<int>();
+  449   msg.muted = !msg.soundEnabled;
+  450   msg.createdAt = isoNow();
+  451   msg.updatedAt = msg.createdAt;
+  453     JsonArrayConst tags = obj["tags"].as<JsonArrayConst>();
+  455       const char *value = tag.as<const char *>();
+  457         ensureTagPresent(msg.tags, String(value));
+  461   ensureTagPresent(msg.tags, "saved");
+  462   ok = true;
+  463   return msg;
+  465 
+  467   ScheduleRecord schedule;
+  468   ok = false;
+  470     error = "invalid_schedule";
+  471     return schedule;
+  473   JsonObjectConst obj = source.as<JsonObjectConst>();
+  474   const char *messageId = obj["messageId"] | "";
+  476     error = "missing_message_id";
+  477     return schedule;
+  479   const char *id = obj["id"] | "";
+  480   schedule.id = strlen(id) ? String(id) : generateId("sch");
+  481   schedule.messageId = messageId;
+  482   schedule.time = String(obj["time"] | "");
+  483   schedule.timezone = String(obj["timezone"] | "UTC");
+  484   schedule.enabled = obj.containsKey("enabled") ? obj["enabled"].as<bool>() : true;
+  486     JsonArrayConst days = obj["days"].as<JsonArrayConst>();
+  488       const char *value = item.as<const char *>();
+  490         schedule.days.push_back(String(value));
+  495     JsonArrayConst dates = obj["specificDates"].as<JsonArrayConst>();
+  497       const char *value = item.as<const char *>();
+  499         schedule.specificDates.push_back(String(value));
+  503   schedule.recurrenceSummary = computeRecurrenceSummary(schedule);
+  504   computeNextRunAtApprox(schedule);
+  505   ok = true;
+  506   return schedule;
+  508 
+  510   msg.updatedAt = isoNow();
+  511   ensureTagPresent(msg.tags, "saved");
+  512   upsertMessage(msg);
+  513   currentMessage = msg;
+  514   hasCurrentMessage = true;
+  515   currentScrollsDone = 0;
+  516   currentTimeLeftSec = msg.durationSec;
+  517   appendLogEntry(msg, "sent");
+  518   return msg;
+  520 
+  522   computeNextRunAtApprox(schedule);
+  523   schedule.recurrenceSummary = computeRecurrenceSummary(schedule);
+  524   upsertSchedule(schedule);
+  525   markMessageScheduled(schedule.messageId, true);
+  526   return schedule;
+  528 
+  529 
+  531   server.sendHeader("Access-Control-Allow-Origin", "*");
+  532   server.sendHeader("Access-Control-Allow-Methods",
+  533                     "GET,POST,PUT,DELETE,OPTIONS");
+  534   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  537   server.sendHeader("Cache-Control", "public, max-age=" + String(secs));
+  539 
+  541   if (suffix.length() > str.length())
+  542     return false;
+  543   return str.substring(str.length() - suffix.length()) == suffix;
+  545 
+  546 // Serve file (gz first), with SPA fallback handled by caller
+  548   if (endsWith(path, "/"))
+  549     path += "index.html";
+  550   String gz = path + ".gz";
+  551   if (LittleFS.exists(gz))
+  552     path = gz;
+  553   else if (!LittleFS.exists(path))
+  554     return false;
+  555 
+  556   String type = "text/plain";
+  557   if (endsWith(path, ".html") || endsWith(path, ".html.gz"))
+  558     type = "text/html";
+  559   else if (endsWith(path, ".js") || endsWith(path, ".js.gz"))
+  560     type = "application/javascript";
+  561   else if (endsWith(path, ".css") || endsWith(path, ".css.gz"))
+  562     type = "text/css";
+  563   else if (endsWith(path, ".json") || endsWith(path, ".json.gz"))
+  564     type = "application/json";
+  565   else if (endsWith(path, ".png") || endsWith(path, ".png.gz"))
+  566     type = "image/png";
+  567   else if (endsWith(path, ".svg") || endsWith(path, ".svg.gz"))
+  568     type = "image/svg+xml";
+  569   else if (endsWith(path, ".ico") || endsWith(path, ".ico.gz"))
+  570     type = "image/x-icon";
+  571 
+  572   File f = LittleFS.open(path, "r");
+  573   if (!f)
+  574     return false;
+  575 
+  576   addCORS();
+  577   if (type == "text/html")
+  578     addCache(5); // keep index.html fresh
+  579   else
+  580     addCache(31536000); // long cache for hashed assets
+  581 
+  582   server.streamFile(f, type);
+  583   f.close();
+  584   return true;
+  586 
+  588   addCORS();
+  589   server.send(code, "application/json", body);
+  591 
+  593   StaticJsonDocument<256> doc;
+  594   doc["type"] = "state";
+  595   doc["uptime"] = millis() / 1000;
+  596   doc["relay"] = relayOn;
+  597   String out;
+  598   serializeJson(doc, out);
+  599   ws.broadcastTXT(out);
+  601 
+  602 // SoftAP helpers keep AP settings consistent whenever the mode flips.
+  604   WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
+  605   WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, false, AP_MAX_CONN);
+  607 
+  610     WiFi.mode(WIFI_AP);
+  612   ensureSoftAP();
+  614 
+  617     WiFi.mode(WIFI_AP_STA);
+  619   ensureSoftAP();
+  621 
+  623   ensureApStaMode();
+  624   WiFi.setAutoConnect(true);
+  625   WiFi.setAutoReconnect(true);
+  626   const char *passPtr = pass.length() ? pass.c_str() : nullptr;
+  627   WiFi.begin(ssid.c_str(), passPtr);
+  629 
+  631   return static_cast<wl_status_t>(WiFi.waitForConnectResult(timeoutMs));
+  633 
+  636   case WL_CONNECTED:
+  637     return "connected";
+  638   case WL_IDLE_STATUS:
+  639     return "idle";
+  640   case WL_NO_SSID_AVAIL:
+  641     return "no_ssid";
+  642   case WL_CONNECT_FAILED:
+  643     return "connect_failed";
+  644   case WL_CONNECTION_LOST:
+  645     return "connection_lost";
+  646   case WL_DISCONNECTED:
+  647     return "disconnected";
+  648   default:
+  649     return String(static_cast<int>(status));
+  652 
+  655   case WIFI_OFF:
+  656     return "off";
+  657   case WIFI_STA:
+  658     return "sta";
+  659   case WIFI_AP:
+  660     return "ap";
+  661   case WIFI_AP_STA:
+  662     return "ap_sta";
+  663   default:
+  664     return String(static_cast<int>(mode));
+  667 
+  669   File f = LittleFS.open(WIFI_CONFIG_PATH, "r");
+  670   if (!f)
+  671     return false;
+  672   StaticJsonDocument<256> doc;
+  673   DeserializationError err = deserializeJson(doc, f);
+  674   f.close();
+  675   if (err)
+  676     return false;
+  677   const char *ssid = doc["ssid"] | "";
+  678   if (!ssid[0])
+  679     return false;
+  680   const char *pass = doc["pass"] | "";
+  681   staSsid = ssid;
+  682   staPass = pass;
+  683   staPersist = true;
+  684   return true;
+  686 
+  688   StaticJsonDocument<256> doc;
+  689   doc["ssid"] = ssid;
+  690   doc["pass"] = pass;
+  691   File f = LittleFS.open(WIFI_CONFIG_PATH, "w");
+  692   if (!f)
+  693     return false;
+  695     f.close();
+  696     LittleFS.remove(WIFI_CONFIG_PATH);
+  697     return false;
+  699   f.close();
+  700   staSsid = ssid;
+  701   staPass = pass;
+  702   staPersist = true;
+  703   return true;
+  705 
+  707   staSsid = "";
+  708   staPass = "";
+  709   staPersist = false;
+  711     LittleFS.remove(WIFI_CONFIG_PATH);
+  714 
+  716   StaticJsonDocument<384> doc;
+  717   wl_status_t status = WiFi.status();
+  718   WiFiMode_t mode = WiFi.getMode();
+  719 
+  720   doc["ok"] = true;
+  721   doc["mode"] = wifiModeToString(mode);
+  722   doc["status"] = wlStatusToString(status);
+  723   bool connected = status == WL_CONNECTED;
+  724   doc["connected"] = connected;
+  725   doc["ssid"] = connected ? WiFi.SSID() : staSsid;
+  726   doc["bssid"] = connected ? WiFi.BSSIDstr() : "";
+  727   doc["ip"] = connected ? WiFi.localIP().toString() : "";
+  728   doc["rssi"] = connected ? WiFi.RSSI() : 0;
+  729   doc["channel"] = connected ? WiFi.channel() : 0;
+  730   doc["apIp"] = WiFi.softAPIP().toString();
+  731   doc["apClients"] = WiFi.softAPgetStationNum();
+  732   doc["hasCreds"] = staSsid.length() > 0;
+  733   doc["persisted"] = staPersist;
+  734 
+  735   serializeJson(doc, out);
+  737 
+  738 // ===== Wi-Fi scan utilities =====
+  741   case ENC_TYPE_NONE:
+  742     return "open";
+  743   case ENC_TYPE_WEP:
+  744     return "wep";
+  745   case ENC_TYPE_TKIP:
+  746     return "wpa";
+  747   case ENC_TYPE_CCMP:
+  748     return "wpa2";
+  749   case ENC_TYPE_AUTO:
+  750     return "auto";
+  751   default:
+  752     return String(e);
+  755 
+  756 // Build JSON array string of available networks
+  758   arrOut = "[";
+  759   bool first = true;
+  760   int n = WiFi.scanComplete();
+  762     n = WiFi.scanNetworks(); // blocking
+  765     if (!first)
+  766       arrOut += ",";
+  767     first = false;
+  768     StaticJsonDocument<256> item;
+  769     item["ssid"] = WiFi.SSID(i);
+  770     item["rssi"] = WiFi.RSSI(i);
+  771     item["ch"] = WiFi.channel(i);
+  772     item["enc"] = encToStr(WiFi.encryptionType(i));
+  773     String it;
+  774     serializeJson(item, it);
+  775     arrOut += it;
+  777   WiFi.scanDelete();
+  778   arrOut += "]";
+  780 
+  781 // Run a scan. If we were AP-only, temporarily enable STA then restore.
+  783   WiFiMode_t mode = WiFi.getMode();
+  784   bool wasAPOnly = (mode == WIFI_AP);
+  786     ensureApStaMode();
+  788   WiFi.disconnect();
+  789   delay(100);
+  790   WiFi.scanNetworks();
+  791   buildWifiListJson(listArrayJson);
+  793     ensureApMode();
+  796 
+  797 // ===== API & captive portal routes =====
+  799   // Common captive-portal probes (improves auto-popup)
+  801     server.sendHeader("Location", "http://192.168.4.1/");
+  802     server.send(302, "text/plain", "");
+  805     server.sendHeader("Location", "http://192.168.4.1/");
+  806     server.send(302, "text/plain", "");
+  809     server.send(200, "text/html",
+  810                 "<html><head><meta http-equiv='refresh' content='0; "
+  811                 "url=/'/></head></html>");
+  813 
+  814   // API
+  816     String sta = WiFi.localIP().toString();
+  817     String ap = WiFi.softAPIP().toString();
+  818     StaticJsonDocument<256> doc;
+  819     doc["ok"] = true;
+  820     doc["staIP"] = sta;
+  821     doc["apIP"] = ap;
+  822     doc["uptime"] = millis() / 1000;
+  823     doc["relay"] = relayOn;
+  824     String out;
+  825     serializeJson(doc, out);
+  826     sendJson(200, out);
+  828 
+  831     String body = server.arg("plain");
+  832     StaticJsonDocument<128> doc;
+  833     auto err = deserializeJson(doc, body);
+  836       return;
+  838     bool on = doc["on"] | false;
+  839     relayOn = on;
+  840     digitalWrite(RELAY_PIN, relayOn ? LOW : HIGH);
+  842     pushState();
+  844 
+  846     String out;
+  847     buildWifiStatusJson(out);
+  848     sendJson(200, out);
+  850 
+  851   // Wi-Fi scan endpoint (blocking; may momentarily disrupt AP)
+  853     String list;
+  854     runWifiScan(list);
+  856     sendJson(200, out);
+  858 
+  860     String body = server.arg("plain");
+  861     StaticJsonDocument<256> doc;
+  862     auto err = deserializeJson(doc, body);
+  865       return;
+  867     const char *ssid = doc["ssid"] | "";
+  868     const char *pass = doc["pass"] | "";
+  871       return;
+  873 
+  874     staSsid = ssid;
+  875     staPass = pass;
+  876     staPersist = false;
+  877 
+  878     beginSta(staSsid, staPass);
+  879     wl_status_t res = waitForSta(15000);
+  881       WiFi.setAutoReconnect(false);
+  883 
+  884     StaticJsonDocument<256> reply;
+  885     reply["ok"] = res == WL_CONNECTED;
+  886     reply["status"] = wlStatusToString(res);
+  887     reply["ssid"] = WiFi.SSID();
+  888     reply["ip"] = WiFi.localIP().toString();
+  890       reply["rssi"] = WiFi.RSSI();
+  892     String out;
+  893     serializeJson(reply, out);
+  894     sendJson(res == WL_CONNECTED ? 200 : 500, out);
+  896 
+  898     WiFi.setAutoReconnect(false);
+  899     WiFi.disconnect(false);
+  900     ensureApMode();
+  901 
+  902     StaticJsonDocument<160> reply;
+  903     reply["ok"] = true;
+  904     reply["status"] = wlStatusToString(WiFi.status());
+  905     String out;
+  906     serializeJson(reply, out);
+  907     sendJson(200, out);
+  909 
+  911     WiFi.setAutoReconnect(false);
+  912     WiFi.setAutoConnect(false);
+  913     WiFi.disconnect(true);
+  914     clearStaState(true);
+  915     ensureApMode();
+  918 
+  920     String body = server.arg("plain");
+  921     StaticJsonDocument<256> doc;
+  922     auto err = deserializeJson(doc, body);
+  925       return;
+  927     const char *ssid = doc["ssid"] | "";
+  928     const char *pass = doc["pass"] | "";
+  929     bool connectNow = doc["connect"] | false;
+  932       return;
+  934 
+  935     bool saved = saveStaCredentialsToFile(String(ssid), String(pass));
+  938       return;
+  940 
+  941     StaticJsonDocument<256> reply;
+  942     reply["ok"] = true;
+  943     reply["saved"] = true;
+  944 
+  946       beginSta(staSsid, staPass);
+  947       wl_status_t res = waitForSta(15000);
+  948       reply["connected"] = res == WL_CONNECTED;
+  949       reply["status"] = wlStatusToString(res);
+  950       reply["ip"] = WiFi.localIP().toString();
+  952         reply["rssi"] = WiFi.RSSI();
+  954         WiFi.setAutoReconnect(true); // keep retrying with saved creds
+  957 
+  958     String out;
+  959     serializeJson(reply, out);
+  960     sendJson(200, out);
+  962 
+  964     StaticJsonDocument<768> doc;
+  965     bool wifiConnected = WiFi.status() == WL_CONNECTED;
+  966     doc["ok"] = true;
+  967     JsonObject device = doc.createNestedObject("device");
+  968     device["connected"] = wifiConnected;
+  969     device["ip"] = wifiConnected ? WiFi.localIP().toString() : String("");
+  970     device["name"] = deviceName;
+  971     device["isOn"] = !relayOn;
+  973       device["currentMessageId"] = currentMessage.id;
+  974       device["currentMessageExcerpt"] = excerptFromBody(currentMessage.body);
+  976     device["scrollsDone"] = currentScrollsDone;
+  978       device["timeLeftSec"] = currentTimeLeftSec;
+  980     device["ledColor"] = deviceSettings.ledColor;
+  981     device["font"] = deviceSettings.font;
+  982     device["rtcTime"] = isoNow();
+  983     device["batteryPct"] = batteryPercentage;
+  984 
+  985     JsonObject capabilities = doc.createNestedObject("capabilities");
+  986     capabilities["maxCharsPerFrame"] = CAP_MAX_CHARS;
+  987     capabilities["supportsSound"] = CAP_SUPPORTS_SOUND;
+  988     capabilities["supportsMultiMessageBatch"] = CAP_SUPPORTS_MULTI;
+  989 
+  990     JsonObject settings = doc.createNestedObject("settings");
+  991     settingsToJson(settings);
+  992 
+  994       JsonObject current = doc.createNestedObject("currentMessage");
+  995       messageToJson(currentMessage, current);
+  997 
+  998     String out;
+  999     serializeJson(doc, out);
+ 1000     sendJson(200, out);
+ 1002 
+ 1004     String body = server.arg("plain");
+ 1005     StaticJsonDocument<256> doc;
+ 1006     auto err = deserializeJson(doc, body);
+ 1009       return;
+ 1011     uint64_t epochMs = doc["epochMs"].as<uint64_t>();
+ 1012     rtcEpochBaseMs = epochMs;
+ 1013     rtcBaseMillis = millis();
+ 1014 
+ 1015     StaticJsonDocument<192> reply;
+ 1016     reply["ok"] = true;
+ 1017     reply["rtcTime"] = isoFromEpoch(epochMs);
+ 1018     String out;
+ 1019     serializeJson(reply, out);
+ 1020     sendJson(200, out);
+ 1022 
+ 1024     StaticJsonDocument<768> doc;
+ 1025     doc["ok"] = true;
+ 1027       JsonObject message = doc.createNestedObject("message");
+ 1028       messageToJson(currentMessage, message);
+ 1029       doc["scrollsDone"] = currentScrollsDone;
+ 1031         doc["timeLeftSec"] = currentTimeLeftSec;
+ 1034     String out;
+ 1035     serializeJson(doc, out);
+ 1036     sendJson(200, out);
+ 1038 
+ 1040     String body = server.arg("plain");
+ 1041     StaticJsonDocument<3072> doc;
+ 1042     auto err = deserializeJson(doc, body);
+ 1045       return;
+ 1047 
+ 1048     StaticJsonDocument<2048> reply;
+ 1049     reply["ok"] = true;
+ 1050     bool processed = false;
+ 1051 
+ 1053       JsonArray arr = doc["messages"].as<JsonArray>();
+ 1054       JsonArray outArr = reply.createNestedArray("messages");
+ 1056         bool ok;
+ 1057         String parseError;
+ 1058         MessageRecord msg = buildMessageFromJson(item, ok, parseError);
+ 1061           return;
+ 1063         MessageRecord delivered = prepareSendMessage(msg);
+ 1064         JsonObject dest = outArr.createNestedObject();
+ 1065         messageToJson(delivered, dest);
+ 1066         processed = true;
+ 1069       bool ok;
+ 1070       String parseError;
+ 1071       MessageRecord msg = buildMessageFromJson(doc["message"], ok, parseError);
+ 1074         return;
+ 1076       MessageRecord delivered = prepareSendMessage(msg);
+ 1077       JsonObject dest = reply.createNestedObject("message");
+ 1078       messageToJson(delivered, dest);
+ 1079       processed = true;
+ 1082       return;
+ 1084 
+ 1087       return;
+ 1089 
+ 1090     String out;
+ 1091     serializeJson(reply, out);
+ 1092     sendJson(200, out);
+ 1094 
+ 1096     String body = server.arg("plain");
+ 1097     StaticJsonDocument<2048> doc;
+ 1098     auto err = deserializeJson(doc, body);
+ 1101       return;
+ 1103     bool ok;
+ 1104     String parseError;
+ 1105     ScheduleRecord schedule = buildScheduleFromJson(doc["schedule"], ok, parseError);
+ 1108       return;
+ 1110     ScheduleRecord stored = registerSchedule(schedule);
+ 1111 
+ 1112     StaticJsonDocument<1024> reply;
+ 1113     reply["ok"] = true;
+ 1114     JsonObject sch = reply.createNestedObject("schedule");
+ 1115     scheduleToJson(stored, sch);
+ 1116     String out;
+ 1117     serializeJson(reply, out);
+ 1118     sendJson(200, out);
+ 1120 
+ 1122     StaticJsonDocument<2048> doc;
+ 1123     doc["ok"] = true;
+ 1124     JsonArray logs = doc.createNestedArray("logs");
+ 1126       JsonObject item = logs.createNestedObject();
+ 1127       item["id"] = entry.id;
+ 1128       item["messageId"] = entry.messageId;
+ 1129       item["title"] = entry.title;
+ 1130       item["status"] = entry.status;
+ 1131       item["createdAt"] = entry.createdAt;
+ 1132       item["excerpt"] = excerptFromBody(entry.body);
+ 1134     String out;
+ 1135     serializeJson(doc, out);
+ 1136     sendJson(200, out);
+ 1138 
+ 1140     StaticJsonDocument<512> doc;
+ 1141     doc["ok"] = true;
+ 1142     JsonObject settings = doc.createNestedObject("settings");
+ 1143     settingsToJson(settings);
+ 1144     String out;
+ 1145     serializeJson(doc, out);
+ 1146     sendJson(200, out);
+ 1148 
+ 1150     String body = server.arg("plain");
+ 1151     StaticJsonDocument<512> doc;
+ 1152     auto err = deserializeJson(doc, body);
+ 1155       return;
+ 1158       deviceSettings.dateDisplayEnabled = doc["dateDisplayEnabled"].as<bool>();
+ 1161       deviceSettings.calendarVisible = doc["calendarVisible"].as<bool>();
+ 1164       deviceSettings.ledColor = String(doc["ledColor"].as<const char *>());
+ 1167       deviceSettings.font = String(doc["font"].as<const char *>());
+ 1170       deviceSettings.soundEnabled = doc["soundEnabled"].as<bool>();
+ 1172     StaticJsonDocument<512> reply;
+ 1173     reply["ok"] = true;
+ 1174     JsonObject settings = reply.createNestedObject("settings");
+ 1175     settingsToJson(settings);
+ 1176     String out;
+ 1177     serializeJson(reply, out);
+ 1178     sendJson(200, out);
+ 1180 
+ 1182     lastPairingChallenge = generateId("challenge");
+ 1183     StaticJsonDocument<256> doc;
+ 1184     doc["challenge"] = lastPairingChallenge;
+ 1185     doc["deviceId"] = deviceId;
+ 1186     String out;
+ 1187     serializeJson(doc, out);
+ 1188     sendJson(200, out);
+ 1190 
+ 1192     String body = server.arg("plain");
+ 1193     StaticJsonDocument<512> doc;
+ 1194     auto err = deserializeJson(doc, body);
+ 1197       return;
+ 1199     const char *challenge = doc["challenge"] | "";
+ 1200     const char *userId = doc["userId"] | "";
+ 1203       return;
+ 1205     deviceToken = generateId("token");
+ 1206     claimedUserId = String(userId);
+ 1207     lastPairingChallenge = "";
+ 1208 
+ 1209     StaticJsonDocument<512> reply;
+ 1210     reply["ok"] = true;
+ 1211     reply["deviceToken"] = deviceToken;
+ 1212     reply["deviceId"] = deviceId;
+ 1213     reply["claimed"] = claimedUserId;
+ 1214     reply["issuedAt"] = isoNow();
+ 1215     String out;
+ 1216     serializeJson(reply, out);
+ 1217     sendJson(200, out);
+ 1219 
+ 1220   // Static + SPA fallback + CORS preflight
+ 1223       addCORS();
+ 1224       server.send(204);
+ 1225       return;
+ 1227     if (serveStaticFile(server.uri()))
+ 1228       return;
+ 1229     // SPA fallback to /
+ 1230     if (serveStaticFile("/index.html"))
+ 1231       return;
+ 1232     addCORS();
+ 1233     server.send(404, "text/plain", "Not found");
+ 1236 
+ 1237 // ===== WebSocket =====
+ 1238 uint32_t lastPush = 0;
+ 1239 
+ 1243     pushState();
+ 1245     StaticJsonDocument<256> doc;
+ 1246     DeserializationError err = deserializeJson(doc, payload, len);
+ 1247     if (err)
+ 1248       return;
+ 1249 
+ 1250     const char *t = doc["type"] | "";
+ 1253       return;
+ 1256       bool on = doc["on"] | false;
+ 1257       relayOn = on;
+ 1258       digitalWrite(RELAY_PIN, relayOn ? LOW : HIGH);
+ 1259       pushState();
+ 1260       return;
+ 1264       String list;
+ 1265       runWifiScan(list);
+ 1267       ws.sendTXT(num, out);
+ 1268       return;
+ 1272 
+ 1273 // ===== Setup / loop =====
+ 1275   pinMode(RELAY_PIN, OUTPUT);
+ 1276   digitalWrite(RELAY_PIN, HIGH); // relay off (depending on module logic)
+ 1277 
+ 1278   Serial.begin(115200);
+ 1279   randomSeed(ESP.getChipId());
+ 1280   delay(200);
+ 1281 
+ 1283     Serial.println("LittleFS mount failed");
+ 1285     loadStaCredentialsFromFile();
+ 1287 
+ 1288   // WiFi radio stability tweaks
+ 1289   WiFi.setSleepMode(WIFI_NONE_SLEEP); // keep radio awake for AP stability
+ 1290   WiFi.setOutputPower(20.5f);         // max TX power for ESP8266
+ 1291   WiFi.setPhyMode(WIFI_PHY_MODE_11N); // better throughput / stability
+ 1292 
+ 1294     bool hasDefault =
+ 1295         strlen(STA_SSID) > 0 && strcmp(STA_SSID, "HOME_SSID") != 0;
+ 1297       staSsid = STA_SSID;
+ 1298       staPass = STA_PASS;
+ 1299       staPersist = false;
+ 1302 
+ 1304     beginSta(staSsid, staPass);
+ 1306     ensureApMode();
+ 1307     WiFi.setAutoConnect(false);
+ 1308     WiFi.setAutoReconnect(false);
+ 1310 
+ 1311   // Captive DNS
+ 1312   dns.start(53, "*", AP_IP);
+ 1313 
+ 1314   // HTTP + WS
+ 1315   setupRoutes();
+ 1316   server.begin();
+ 1317   ws.begin();
+ 1318   ws.onEvent(onWsEvent);
+ 1319   // Detect dead peers and recover quicker
+ 1320   ws.enableHeartbeat(15000, 3000, 2); // ping interval, timeout, max misses
+ 1321 
+ 1322   Serial.println("Ready:");
+ 1323   Serial.print("  AP SSID: ");
+ 1324   Serial.println(AP_SSID);
+ 1325   Serial.print("  AP IP:   ");
+ 1326   Serial.println(WiFi.softAPIP());
+ 1327   Serial.println("  HTTP:    http://192.168.4.1/");
+ 1328   Serial.println("  WS:      ws://192.168.4.1:81");
+ 1330 
+ 1332   dns.processNextRequest();
+ 1333   server.handleClient();
+ 1334   ws.loop();
+ 1335 
+ 1336   // periodic broadcast
+ 1338     lastPush = millis();
+ 1339     pushState();

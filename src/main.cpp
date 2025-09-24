@@ -2,8 +2,12 @@
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
+#include <ESP.h>
 #include <LittleFS.h>
 #include <WebSocketsServer.h>
+#include <algorithm>
+#include <time.h>
+#include <vector>
 
 // ===== Pins / device state (example) =====
 #define RELAY_PIN D1 // adjust for your board
@@ -34,7 +38,495 @@ String staSsid;
 String staPass;
 bool staPersist = false;
 
+struct DeviceSettingsData {
+  bool dateDisplayEnabled = true;
+  bool calendarVisible = true;
+  String ledColor = "#FF5A5F";
+  String font = "Orbitron";
+  bool soundEnabled = true;
+};
+
+struct MessageRecord {
+  String id;
+  String title;
+  String body;
+  String soundFileId;
+  bool soundEnabled = false;
+  String scrollSpeed;
+  String animation;
+  int durationSec = 0;
+  int numScrolls = 0;
+  bool muted = true;
+  String createdAt;
+  String updatedAt;
+  std::vector<String> tags;
+};
+
+struct ScheduleRecord {
+  String id;
+  String messageId;
+  std::vector<String> days;
+  std::vector<String> specificDates;
+  String time;
+  String timezone;
+  String nextRunAt;
+  bool enabled = true;
+  String recurrenceSummary;
+};
+
+struct LogEntry {
+  String id;
+  String messageId;
+  String title;
+  String body;
+  String status;
+  String createdAt;
+};
+
+DeviceSettingsData deviceSettings;
+std::vector<MessageRecord> messageStore;
+std::vector<ScheduleRecord> scheduleStore;
+std::vector<LogEntry> logEntries;
+
+MessageRecord currentMessage;
+bool hasCurrentMessage = false;
+int currentScrollsDone = 0;
+int currentTimeLeftSec = 0;
+
+const size_t MAX_LOG_ENTRIES = 20;
+const size_t MAX_MESSAGES = 20;
+const size_t MAX_SCHEDULES = 20;
+
+const int CAP_MAX_CHARS = 32;
+const bool CAP_SUPPORTS_SOUND = true;
+const bool CAP_SUPPORTS_MULTI = false;
+
+String deviceName = "PixelSign-01";
+int batteryPercentage = 78;
+
+uint64_t rtcEpochBaseMs = 0;
+uint32_t rtcBaseMillis = 0;
+
+String lastPairingChallenge;
+String deviceToken;
+String claimedUserId;
+
+String deviceId = String(ESP.getChipId(), HEX);
+
 // ===== Helpers =====
+template <typename T>
+void clampVectorSize(std::vector<T> &vec, size_t maxSize) {
+  if (vec.size() <= maxSize) {
+    return;
+  }
+  vec.erase(vec.begin(), vec.begin() + (vec.size() - maxSize));
+}
+
+int weekdayIndexFromString(const String &day) {
+  if (day.equalsIgnoreCase("Sun")) return 0;
+  if (day.equalsIgnoreCase("Mon")) return 1;
+  if (day.equalsIgnoreCase("Tue")) return 2;
+  if (day.equalsIgnoreCase("Wed")) return 3;
+  if (day.equalsIgnoreCase("Thu")) return 4;
+  if (day.equalsIgnoreCase("Fri")) return 5;
+  if (day.equalsIgnoreCase("Sat")) return 6;
+  return -1;
+}
+
+bool timeStringToParts(const String &value, int &hour, int &minute) {
+  if (!value.length()) {
+    hour = 0;
+    minute = 0;
+    return false;
+  }
+  int sep = value.indexOf(':');
+  if (sep < 0) {
+    return false;
+  }
+  hour = value.substring(0, sep).toInt();
+  minute = value.substring(sep + 1).toInt();
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return false;
+  }
+  return true;
+}
+
+String joinStrings(const std::vector<String> &values, const char *delimiter) {
+  String result;
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      result += delimiter;
+    }
+    result += values[i];
+  }
+  return result;
+}
+
+uint64_t currentEpochMs() {
+  if (rtcEpochBaseMs == 0) {
+    return static_cast<uint64_t>(millis());
+  }
+  uint32_t elapsed = millis() - rtcBaseMillis;
+  return rtcEpochBaseMs + static_cast<uint64_t>(elapsed);
+}
+
+String isoFromEpoch(uint64_t epochMs) {
+  time_t seconds = epochMs / 1000ULL;
+  struct tm *info = gmtime(&seconds);
+  if (!info) {
+    char fallback[24];
+    snprintf(fallback, sizeof(fallback), "%llu", static_cast<unsigned long long>(epochMs));
+    return String(fallback);
+  }
+  char buffer[32];
+  snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+           info->tm_year + 1900, info->tm_mon + 1, info->tm_mday,
+           info->tm_hour, info->tm_min, info->tm_sec);
+  return String(buffer);
+}
+
+String isoNow() {
+  return isoFromEpoch(currentEpochMs());
+}
+
+String generateId(const char *prefix) {
+  char buffer[40];
+  unsigned long now = millis();
+  uint16_t entropy = static_cast<uint16_t>(random(0xFFFF));
+  snprintf(buffer, sizeof(buffer), "%s-%lu-%04u", prefix, now, entropy);
+  return String(buffer);
+}
+
+String excerptFromBody(const String &body) {
+  if (body.length() <= 64) {
+    return body;
+  }
+  return body.substring(0, 64);
+}
+
+void ensureTagPresent(std::vector<String> &tags, const String &tag) {
+  if (std::find(tags.begin(), tags.end(), tag) == tags.end()) {
+    tags.push_back(tag);
+  }
+}
+
+void removeTag(std::vector<String> &tags, const String &tag) {
+  auto it = std::remove_if(tags.begin(), tags.end(), [&](const String &entry) {
+    return entry.equalsIgnoreCase(tag);
+  });
+  tags.erase(it, tags.end());
+}
+
+void messageToJson(const MessageRecord &msg, JsonObject obj) {
+  obj["id"] = msg.id;
+  obj["title"] = msg.title;
+  obj["body"] = msg.body;
+  if (msg.soundFileId.length()) {
+    obj["soundFileId"] = msg.soundFileId;
+  }
+  obj["soundEnabled"] = msg.soundEnabled;
+  obj["scrollSpeed"] = msg.scrollSpeed;
+  obj["animation"] = msg.animation;
+  if (msg.durationSec > 0) {
+    obj["durationSec"] = msg.durationSec;
+  }
+  if (msg.numScrolls > 0) {
+    obj["numScrolls"] = msg.numScrolls;
+  }
+  obj["muted"] = msg.muted;
+  obj["createdAt"] = msg.createdAt;
+  obj["updatedAt"] = msg.updatedAt;
+  JsonArray tagsArray = obj.createNestedArray("tags");
+  for (const auto &tag : msg.tags) {
+    tagsArray.add(tag);
+  }
+}
+
+void scheduleToJson(const ScheduleRecord &schedule, JsonObject obj) {
+  obj["id"] = schedule.id;
+  obj["messageId"] = schedule.messageId;
+  if (!schedule.days.empty()) {
+    JsonArray daysArray = obj.createNestedArray("days");
+    for (const auto &day : schedule.days) {
+      daysArray.add(day);
+    }
+  }
+  if (!schedule.specificDates.empty()) {
+    JsonArray datesArray = obj.createNestedArray("specificDates");
+    for (const auto &date : schedule.specificDates) {
+      datesArray.add(date);
+    }
+  }
+  if (schedule.time.length()) {
+    obj["time"] = schedule.time;
+  }
+  if (schedule.timezone.length()) {
+    obj["timezone"] = schedule.timezone;
+  }
+  if (schedule.nextRunAt.length()) {
+    obj["nextRunAt"] = schedule.nextRunAt;
+  }
+  obj["enabled"] = schedule.enabled;
+  if (schedule.recurrenceSummary.length()) {
+    obj["recurrenceSummary"] = schedule.recurrenceSummary;
+  }
+}
+
+void settingsToJson(JsonObject obj) {
+  obj["dateDisplayEnabled"] = deviceSettings.dateDisplayEnabled;
+  obj["calendarVisible"] = deviceSettings.calendarVisible;
+  obj["ledColor"] = deviceSettings.ledColor;
+  obj["font"] = deviceSettings.font;
+  obj["soundEnabled"] = deviceSettings.soundEnabled;
+}
+
+String computeRecurrenceSummary(const ScheduleRecord &schedule) {
+  if (!schedule.specificDates.empty()) {
+    String summary = joinStrings(schedule.specificDates, ", ");
+    if (schedule.time.length()) {
+      summary += " at ";
+      summary += schedule.time;
+    }
+    return summary;
+  }
+  if (!schedule.days.empty()) {
+    String summary = joinStrings(schedule.days, ", ");
+    if (schedule.time.length()) {
+      summary += " at ";
+      summary += schedule.time;
+    }
+    return summary;
+  }
+  if (schedule.time.length()) {
+    return String("Daily at ") + schedule.time;
+  }
+  return String("Custom schedule");
+}
+
+String computeNextRunAtApprox(ScheduleRecord &schedule) {
+  if (!schedule.specificDates.empty()) {
+    String earliest = schedule.specificDates[0];
+    for (const auto &candidate : schedule.specificDates) {
+      if (candidate < earliest) {
+        earliest = candidate;
+      }
+    }
+    String timePart = schedule.time.length() ? schedule.time : String("00:00");
+    schedule.nextRunAt = earliest + "T" + timePart + ":00Z";
+    return schedule.nextRunAt;
+  }
+  if (!schedule.days.empty() && rtcEpochBaseMs != 0) {
+    uint64_t nowMs = currentEpochMs();
+    time_t nowSec = nowMs / 1000ULL;
+    struct tm *info = gmtime(&nowSec);
+    if (info) {
+      int currentDow = info->tm_wday;
+      int hour = 0;
+      int minute = 0;
+      timeStringToParts(schedule.time, hour, minute);
+      int targetSeconds = hour * 3600 + minute * 60;
+      int bestDiff = 8;
+      for (const auto &day : schedule.days) {
+        int idx = weekdayIndexFromString(day);
+        if (idx < 0) {
+          continue;
+        }
+        int diff = (idx - currentDow + 7) % 7;
+        if (diff == 0) {
+          int nowSeconds = info->tm_hour * 3600 + info->tm_min * 60 + info->tm_sec;
+          if (targetSeconds <= nowSeconds) {
+            diff = 7;
+          }
+        }
+        if (diff < bestDiff) {
+          bestDiff = diff;
+        }
+      }
+      if (bestDiff <= 7) {
+        uint64_t baseSeconds = (nowSec - (info->tm_hour * 3600 + info->tm_min * 60 + info->tm_sec));
+        uint64_t candidateSeconds = baseSeconds + static_cast<uint64_t>(bestDiff) * 86400ULL + targetSeconds;
+        schedule.nextRunAt = isoFromEpoch(candidateSeconds * 1000ULL);
+        return schedule.nextRunAt;
+      }
+    }
+  }
+  if (schedule.time.length() && rtcEpochBaseMs != 0) {
+    uint64_t nowMs = currentEpochMs();
+    time_t nowSec = nowMs / 1000ULL;
+    struct tm *info = gmtime(&nowSec);
+    if (info) {
+      int hour = 0;
+      int minute = 0;
+      timeStringToParts(schedule.time, hour, minute);
+      uint64_t midnight = nowSec - (info->tm_hour * 3600 + info->tm_min * 60 + info->tm_sec);
+      uint64_t candidateSeconds = midnight + static_cast<uint64_t>(hour) * 3600ULL + static_cast<uint64_t>(minute) * 60ULL;
+      if (candidateSeconds <= nowSec) {
+        candidateSeconds += 86400ULL;
+      }
+      schedule.nextRunAt = isoFromEpoch(candidateSeconds * 1000ULL);
+      return schedule.nextRunAt;
+    }
+  }
+  schedule.nextRunAt = "";
+  return schedule.nextRunAt;
+}
+
+void appendLogEntry(const MessageRecord &msg, const String &status) {
+  LogEntry entry;
+  entry.id = generateId("log");
+  entry.messageId = msg.id;
+  entry.title = msg.title;
+  entry.body = msg.body;
+  entry.status = status;
+  entry.createdAt = msg.updatedAt.length() ? msg.updatedAt : isoNow();
+  logEntries.push_back(entry);
+  clampVectorSize(logEntries, MAX_LOG_ENTRIES);
+}
+
+void upsertMessage(const MessageRecord &msg) {
+  auto it = std::find_if(messageStore.begin(), messageStore.end(), [&](const MessageRecord &existing) {
+    return existing.id == msg.id;
+  });
+  if (it != messageStore.end()) {
+    *it = msg;
+  } else {
+    messageStore.push_back(msg);
+    clampVectorSize(messageStore, MAX_MESSAGES);
+  }
+}
+
+void upsertSchedule(const ScheduleRecord &schedule) {
+  auto it = std::find_if(scheduleStore.begin(), scheduleStore.end(), [&](const ScheduleRecord &existing) {
+    return existing.id == schedule.id;
+  });
+  if (it != scheduleStore.end()) {
+    *it = schedule;
+  } else {
+    scheduleStore.push_back(schedule);
+    clampVectorSize(scheduleStore, MAX_SCHEDULES);
+  }
+}
+
+void markMessageScheduled(const String &messageId, bool scheduled) {
+  auto it = std::find_if(messageStore.begin(), messageStore.end(), [&](const MessageRecord &existing) {
+    return existing.id == messageId;
+  });
+  if (it == messageStore.end()) {
+    return;
+  }
+  if (scheduled) {
+    ensureTagPresent(it->tags, "scheduled");
+  } else {
+    removeTag(it->tags, "scheduled");
+  }
+}
+
+MessageRecord buildMessageFromJson(JsonVariantConst source, bool &ok, String &error) {
+  MessageRecord msg;
+  ok = false;
+  if (source.isNull() || !source.is<JsonObjectConst>()) {
+    error = "invalid_message";
+    return msg;
+  }
+  JsonObjectConst obj = source.as<JsonObjectConst>();
+  const char *title = obj["title"] | "";
+  const char *body = obj["body"] | "";
+  if (strlen(title) == 0 || strlen(body) == 0) {
+    error = "missing_fields";
+    return msg;
+  }
+  const char *id = obj["id"] | "";
+  msg.id = strlen(id) ? String(id) : generateId("msg");
+  msg.title = title;
+  msg.body = body;
+  const char *soundId = obj["soundFileId"] | "";
+  msg.soundFileId = soundId;
+  msg.soundEnabled = obj["soundEnabled"] | false;
+  msg.scrollSpeed = String(obj["scrollSpeed"] | "normal");
+  msg.animation = String(obj["animation"] | "slide");
+  msg.durationSec = obj["durationSec"].isNull() ? 0 : obj["durationSec"].as<int>();
+  msg.numScrolls = obj["numScrolls"].isNull() ? 0 : obj["numScrolls"].as<int>();
+  msg.muted = !msg.soundEnabled;
+  msg.createdAt = isoNow();
+  msg.updatedAt = msg.createdAt;
+  if (obj.containsKey("tags")) {
+    JsonArrayConst tags = obj["tags"].as<JsonArrayConst>();
+    for (JsonVariantConst tag : tags) {
+      const char *value = tag.as<const char *>();
+      if (value && strlen(value) > 0) {
+        ensureTagPresent(msg.tags, String(value));
+      }
+    }
+  }
+  ensureTagPresent(msg.tags, "saved");
+  ok = true;
+  return msg;
+}
+
+ScheduleRecord buildScheduleFromJson(JsonVariantConst source, bool &ok, String &error) {
+  ScheduleRecord schedule;
+  ok = false;
+  if (source.isNull() || !source.is<JsonObjectConst>()) {
+    error = "invalid_schedule";
+    return schedule;
+  }
+  JsonObjectConst obj = source.as<JsonObjectConst>();
+  const char *messageId = obj["messageId"] | "";
+  if (strlen(messageId) == 0) {
+    error = "missing_message_id";
+    return schedule;
+  }
+  const char *id = obj["id"] | "";
+  schedule.id = strlen(id) ? String(id) : generateId("sch");
+  schedule.messageId = messageId;
+  schedule.time = String(obj["time"] | "");
+  schedule.timezone = String(obj["timezone"] | "UTC");
+  schedule.enabled = obj.containsKey("enabled") ? obj["enabled"].as<bool>() : true;
+  if (obj.containsKey("days")) {
+    JsonArrayConst days = obj["days"].as<JsonArrayConst>();
+    for (JsonVariantConst item : days) {
+      const char *value = item.as<const char *>();
+      if (value && strlen(value) > 0) {
+        schedule.days.push_back(String(value));
+      }
+    }
+  }
+  if (obj.containsKey("specificDates")) {
+    JsonArrayConst dates = obj["specificDates"].as<JsonArrayConst>();
+    for (JsonVariantConst item : dates) {
+      const char *value = item.as<const char *>();
+      if (value && strlen(value) > 0) {
+        schedule.specificDates.push_back(String(value));
+      }
+    }
+  }
+  schedule.recurrenceSummary = computeRecurrenceSummary(schedule);
+  computeNextRunAtApprox(schedule);
+  ok = true;
+  return schedule;
+}
+
+MessageRecord prepareSendMessage(MessageRecord msg) {
+  msg.updatedAt = isoNow();
+  ensureTagPresent(msg.tags, "saved");
+  upsertMessage(msg);
+  currentMessage = msg;
+  hasCurrentMessage = true;
+  currentScrollsDone = 0;
+  currentTimeLeftSec = msg.durationSec;
+  appendLogEntry(msg, "sent");
+  return msg;
+}
+
+ScheduleRecord registerSchedule(ScheduleRecord schedule) {
+  computeNextRunAtApprox(schedule);
+  schedule.recurrenceSummary = computeRecurrenceSummary(schedule);
+  upsertSchedule(schedule);
+  markMessageScheduled(schedule.messageId, true);
+  return schedule;
+}
+
+
 void addCORS() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Access-Control-Allow-Methods",
@@ -468,6 +960,263 @@ void setupRoutes() {
     sendJson(200, out);
   });
 
+  server.on("/api/device/state", HTTP_GET, []() {
+    StaticJsonDocument<768> doc;
+    bool wifiConnected = WiFi.status() == WL_CONNECTED;
+    doc["ok"] = true;
+    JsonObject device = doc.createNestedObject("device");
+    device["connected"] = wifiConnected;
+    device["ip"] = wifiConnected ? WiFi.localIP().toString() : String("");
+    device["name"] = deviceName;
+    device["isOn"] = !relayOn;
+    if (hasCurrentMessage) {
+      device["currentMessageId"] = currentMessage.id;
+      device["currentMessageExcerpt"] = excerptFromBody(currentMessage.body);
+    }
+    device["scrollsDone"] = currentScrollsDone;
+    if (currentTimeLeftSec > 0) {
+      device["timeLeftSec"] = currentTimeLeftSec;
+    }
+    device["ledColor"] = deviceSettings.ledColor;
+    device["font"] = deviceSettings.font;
+    device["rtcTime"] = isoNow();
+    device["batteryPct"] = batteryPercentage;
+
+    JsonObject capabilities = doc.createNestedObject("capabilities");
+    capabilities["maxCharsPerFrame"] = CAP_MAX_CHARS;
+    capabilities["supportsSound"] = CAP_SUPPORTS_SOUND;
+    capabilities["supportsMultiMessageBatch"] = CAP_SUPPORTS_MULTI;
+
+    JsonObject settings = doc.createNestedObject("settings");
+    settingsToJson(settings);
+
+    if (hasCurrentMessage) {
+      JsonObject current = doc.createNestedObject("currentMessage");
+      messageToJson(currentMessage, current);
+    }
+
+    String out;
+    serializeJson(doc, out);
+    sendJson(200, out);
+  });
+
+  server.on("/api/device/rtc", HTTP_POST, []() {
+    String body = server.arg("plain");
+    StaticJsonDocument<256> doc;
+    auto err = deserializeJson(doc, body);
+    if (err || doc["epochMs"].isNull()) {
+      sendJson(400, "{\"error\":\"bad_json\"}");
+      return;
+    }
+    uint64_t epochMs = doc["epochMs"].as<uint64_t>();
+    rtcEpochBaseMs = epochMs;
+    rtcBaseMillis = millis();
+
+    StaticJsonDocument<192> reply;
+    reply["ok"] = true;
+    reply["rtcTime"] = isoFromEpoch(epochMs);
+    String out;
+    serializeJson(reply, out);
+    sendJson(200, out);
+  });
+
+  server.on("/api/device/messages/current", HTTP_GET, []() {
+    StaticJsonDocument<768> doc;
+    doc["ok"] = true;
+    if (hasCurrentMessage) {
+      JsonObject message = doc.createNestedObject("message");
+      messageToJson(currentMessage, message);
+      doc["scrollsDone"] = currentScrollsDone;
+      if (currentTimeLeftSec > 0) {
+        doc["timeLeftSec"] = currentTimeLeftSec;
+      }
+    }
+    String out;
+    serializeJson(doc, out);
+    sendJson(200, out);
+  });
+
+  server.on("/api/device/messages/send", HTTP_POST, []() {
+    String body = server.arg("plain");
+    StaticJsonDocument<3072> doc;
+    auto err = deserializeJson(doc, body);
+    if (err) {
+      sendJson(400, "{\"error\":\"bad_json\"}");
+      return;
+    }
+
+    StaticJsonDocument<2048> reply;
+    reply["ok"] = true;
+    bool processed = false;
+
+    if (doc.containsKey("messages")) {
+      JsonArray arr = doc["messages"].as<JsonArray>();
+      JsonArray outArr = reply.createNestedArray("messages");
+      for (JsonVariant item : arr) {
+        bool ok;
+        String parseError;
+        MessageRecord msg = buildMessageFromJson(item, ok, parseError);
+        if (!ok) {
+          sendJson(400, String("{\"error\":\"") + parseError + "\"}");
+          return;
+        }
+        MessageRecord delivered = prepareSendMessage(msg);
+        JsonObject dest = outArr.createNestedObject();
+        messageToJson(delivered, dest);
+        processed = true;
+      }
+    } else if (doc.containsKey("message")) {
+      bool ok;
+      String parseError;
+      MessageRecord msg = buildMessageFromJson(doc["message"], ok, parseError);
+      if (!ok) {
+        sendJson(400, String("{\"error\":\"") + parseError + "\"}");
+        return;
+      }
+      MessageRecord delivered = prepareSendMessage(msg);
+      JsonObject dest = reply.createNestedObject("message");
+      messageToJson(delivered, dest);
+      processed = true;
+    } else {
+      sendJson(400, "{\"error\":\"missing_message\"}");
+      return;
+    }
+
+    if (!processed) {
+      sendJson(400, "{\"error\":\"no_messages\"}");
+      return;
+    }
+
+    String out;
+    serializeJson(reply, out);
+    sendJson(200, out);
+  });
+
+  server.on("/api/device/messages/schedule", HTTP_POST, []() {
+    String body = server.arg("plain");
+    StaticJsonDocument<2048> doc;
+    auto err = deserializeJson(doc, body);
+    if (err || doc["schedule"].isNull()) {
+      sendJson(400, "{\"error\":\"bad_json\"}");
+      return;
+    }
+    bool ok;
+    String parseError;
+    ScheduleRecord schedule = buildScheduleFromJson(doc["schedule"], ok, parseError);
+    if (!ok) {
+      sendJson(400, String("{\"error\":\"") + parseError + "\"}");
+      return;
+    }
+    ScheduleRecord stored = registerSchedule(schedule);
+
+    StaticJsonDocument<1024> reply;
+    reply["ok"] = true;
+    JsonObject sch = reply.createNestedObject("schedule");
+    scheduleToJson(stored, sch);
+    String out;
+    serializeJson(reply, out);
+    sendJson(200, out);
+  });
+
+  server.on("/api/device/logs/recent", HTTP_GET, []() {
+    StaticJsonDocument<2048> doc;
+    doc["ok"] = true;
+    JsonArray logs = doc.createNestedArray("logs");
+    for (const auto &entry : logEntries) {
+      JsonObject item = logs.createNestedObject();
+      item["id"] = entry.id;
+      item["messageId"] = entry.messageId;
+      item["title"] = entry.title;
+      item["status"] = entry.status;
+      item["createdAt"] = entry.createdAt;
+      item["excerpt"] = excerptFromBody(entry.body);
+    }
+    String out;
+    serializeJson(doc, out);
+    sendJson(200, out);
+  });
+
+  server.on("/api/device/settings", HTTP_GET, []() {
+    StaticJsonDocument<512> doc;
+    doc["ok"] = true;
+    JsonObject settings = doc.createNestedObject("settings");
+    settingsToJson(settings);
+    String out;
+    serializeJson(doc, out);
+    sendJson(200, out);
+  });
+
+  server.on("/api/device/settings", HTTP_POST, []() {
+    String body = server.arg("plain");
+    StaticJsonDocument<512> doc;
+    auto err = deserializeJson(doc, body);
+    if (err) {
+      sendJson(400, "{\"error\":\"bad_json\"}");
+      return;
+    }
+    if (doc.containsKey("dateDisplayEnabled")) {
+      deviceSettings.dateDisplayEnabled = doc["dateDisplayEnabled"].as<bool>();
+    }
+    if (doc.containsKey("calendarVisible")) {
+      deviceSettings.calendarVisible = doc["calendarVisible"].as<bool>();
+    }
+    if (doc.containsKey("ledColor")) {
+      deviceSettings.ledColor = String(doc["ledColor"].as<const char *>());
+    }
+    if (doc.containsKey("font")) {
+      deviceSettings.font = String(doc["font"].as<const char *>());
+    }
+    if (doc.containsKey("soundEnabled")) {
+      deviceSettings.soundEnabled = doc["soundEnabled"].as<bool>();
+    }
+    StaticJsonDocument<512> reply;
+    reply["ok"] = true;
+    JsonObject settings = reply.createNestedObject("settings");
+    settingsToJson(settings);
+    String out;
+    serializeJson(reply, out);
+    sendJson(200, out);
+  });
+
+  server.on("/api/device/pairing-challenge", HTTP_GET, []() {
+    lastPairingChallenge = generateId("challenge");
+    StaticJsonDocument<256> doc;
+    doc["challenge"] = lastPairingChallenge;
+    doc["deviceId"] = deviceId;
+    String out;
+    serializeJson(doc, out);
+    sendJson(200, out);
+  });
+
+  server.on("/api/device/claim", HTTP_POST, []() {
+    String body = server.arg("plain");
+    StaticJsonDocument<512> doc;
+    auto err = deserializeJson(doc, body);
+    if (err) {
+      sendJson(400, "{\"error\":\"bad_json\"}");
+      return;
+    }
+    const char *challenge = doc["challenge"] | "";
+    const char *userId = doc["userId"] | "";
+    if (!strlen(challenge) || lastPairingChallenge != String(challenge)) {
+      sendJson(400, "{\"error\":\"invalid_challenge\"}");
+      return;
+    }
+    deviceToken = generateId("token");
+    claimedUserId = String(userId);
+    lastPairingChallenge = "";
+
+    StaticJsonDocument<512> reply;
+    reply["ok"] = true;
+    reply["deviceToken"] = deviceToken;
+    reply["deviceId"] = deviceId;
+    reply["claimed"] = claimedUserId;
+    reply["issuedAt"] = isoNow();
+    String out;
+    serializeJson(reply, out);
+    sendJson(200, out);
+  });
+
   // Static + SPA fallback + CORS preflight
   server.onNotFound([]() {
     if (server.method() == HTTP_OPTIONS) {
@@ -527,6 +1276,7 @@ void setup() {
   digitalWrite(RELAY_PIN, HIGH); // relay off (depending on module logic)
 
   Serial.begin(115200);
+  randomSeed(ESP.getChipId());
   delay(200);
 
   if (!LittleFS.begin()) {
