@@ -66,3 +66,4 @@ Troubleshooting
 
 License
 This project contains third‑party libraries as declared in `platformio.ini`. Add your preferred license here if needed.
+# Dot-matrix-information-system-2
