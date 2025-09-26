@@ -151,13 +151,13 @@ const MessageForm = ({
               type="text"
               value={values.title}
               onChange={(event) => handleChange("title", event.target.value)}
-              className="w-full rounded-lg border border-input bg-background px-3 py-2 outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary/20"
+              className="w-full rounded-lg border border-input bg-background px-3 py-2 outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary/2 0"
               placeholder="Welcome message"
             />
             {errors.title ? <p className="text-xs text-destructive">{errors.title}</p> : null}
           </label>
           <label className="space-y-2 text-sm">
-            <span className="font-semibold text-foreground">Sound file ID</span>
+            {/* <span className="font-semibold text-foreground">Sound file ID</span>
             <input
               type="text"
               value={values.soundFileId}
@@ -165,7 +165,7 @@ const MessageForm = ({
               disabled={!values.soundEnabled}
               className="w-full rounded-lg border border-input bg-background px-3 py-2 outline-none disabled:cursor-not-allowed disabled:bg-muted/60 focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary/20"
               placeholder="optional-sound.wav"
-            />
+            /> */}
           </label>
         </div>
 
@@ -273,7 +273,7 @@ Line 2"
             </select>
           </label>
         </div>
-        <div className="flex flex-col gap-4 rounded-xl border border-border bg-background/60 p-4 md:flex-row md:items-center md:justify-between">
+        {/* <div className="flex flex-col gap-4 rounded-xl border border-border bg-background/60 p-4 md:flex-row md:items-center md:justify-between">
           <div>
             <p className="text-sm font-semibold">Sound</p>
             <p className="text-xs text-muted-foreground">Toggle per message. Default comes from Settings.</p>
@@ -286,7 +286,7 @@ Line 2"
             />
             Enable sound for this message
           </label>
-        </div>
+        </div> */}
       </section>
 
       <section className="flex flex-col justify-between gap-4 rounded-2xl border border-border bg-card p-6 shadow-sm sm:flex-row sm:items-center">

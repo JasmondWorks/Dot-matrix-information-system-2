@@ -79,7 +79,7 @@ const MessageDetails = () => {
               {message.tags.map((tag) => (
                 <TagChip key={tag} tag={tag} />
               ))}
-              <SoundBadge enabled={message.soundEnabled} />
+              {/* <SoundBadge enabled={message.soundEnabled} /> */}
             </div>
             <p className="text-base text-foreground">{message.body}</p>
           </article>
@@ -103,7 +103,7 @@ const MessageDetails = () => {
             <div className="rounded-xl border border-border/70 bg-background/60 p-4">
               <dt className="text-xs font-semibold uppercase text-muted-foreground">Sound file</dt>
               <dd className="mt-1 text-base font-semibold">
-                {message.soundFileId ?? "Default"}
+                {/* {message.soundFileId ?? "Default"} */}
               </dd>
             </div>
           </dl>

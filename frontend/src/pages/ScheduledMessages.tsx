@@ -77,7 +77,7 @@ const ScheduledMessages = () => {
                       {message ? (
                         message.tags.map((tag) => <TagChip key={`${schedule.id}-${tag}`} tag={tag} />)
                       ) : null}
-                      <SoundBadge enabled={message?.soundEnabled} />
+                      {/* <SoundBadge enabled={message?.soundEnabled} /> */}
                     </div>
                     <p className="text-sm text-muted-foreground">{message?.body}</p>
                     <p className="text-xs uppercase text-muted-foreground">
