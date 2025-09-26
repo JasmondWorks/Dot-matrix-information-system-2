@@ -62,7 +62,7 @@ const Home = () => {
                   {currentMessage.tags.map((tag) => (
                     <TagChip key={tag} tag={tag} />
                   ))}
-                  <SoundBadge enabled={currentMessage.soundEnabled} />
+                  {/* <SoundBadge enabled={currentMessage.soundEnabled} /> */}
                 </div>
               </div>
               <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2">
@@ -173,7 +173,7 @@ const Home = () => {
                   {message.tags.map((tag) => (
                     <TagChip key={tag} tag={tag} />
                   ))}
-                  <SoundBadge enabled={message.soundEnabled} />
+                  {/* <SoundBadge enabled={message.soundEnabled} /> */}
                 </div>
               </div>
               <dl className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
@@ -207,7 +207,7 @@ const Home = () => {
             Body copy longer than this will require scroll count instead of duration.
           </p>
         </div>
-        <div className="rounded-2xl border border-border bg-card p-6 shadow-sm">
+        {/* <div className="rounded-2xl border border-border bg-card p-6 shadow-sm">
           <h3 className="text-sm font-semibold text-muted-foreground">Sound support</h3>
           <p className="mt-2 text-2xl font-bold text-foreground">
             {capabilities.supportsSound ? "Enabled" : "Disabled"}
@@ -215,7 +215,7 @@ const Home = () => {
           <p className="mt-1 text-sm text-muted-foreground">
             Toggle per message or globally from Settings.
           </p>
-        </div>
+        </div> */}
         <div className="rounded-2xl border border-border bg-card p-6 shadow-sm">
           <h3 className="text-sm font-semibold text-muted-foreground">Batch support</h3>
           <p className="mt-2 text-2xl font-bold text-foreground">

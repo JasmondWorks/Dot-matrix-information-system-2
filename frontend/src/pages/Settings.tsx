@@ -41,7 +41,7 @@ const Settings = () => {
             />
           </label>
         </div>
-        <div className="grid gap-4 md:grid-cols-2">
+        {/* <div className="grid gap-4 md:grid-cols-2">
           <label className="space-y-2 text-sm">
             <span className="font-semibold">LED color</span>
             <input
@@ -65,10 +65,10 @@ const Settings = () => {
               ))}
             </select>
           </label>
-        </div>
+        </div> */}
       </section>
 
-      <section className="space-y-4 rounded-2xl border border-border bg-card p-6 shadow-sm">
+      {/* <section className="space-y-4 rounded-2xl border border-border bg-card p-6 shadow-sm">
         <h2 className="text-base font-semibold">Sound</h2>
         <div className="flex flex-col gap-3 rounded-xl border border-border/70 bg-background/60 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
@@ -84,7 +84,7 @@ const Settings = () => {
             Sound enabled
           </label>
         </div>
-      </section>
+      </section> */}
 
       <section className="space-y-4 rounded-2xl border border-border bg-card p-6 shadow-sm">
         <h2 className="text-base font-semibold">Device</h2>

@@ -21,11 +21,11 @@ const NewMessage = () => {
         numScrolls: editingMessage.numScrolls?.toString() ?? "3",
         scrollSpeed: editingMessage.scrollSpeed,
         animation: editingMessage.animation,
-        soundEnabled: editingMessage.soundEnabled ?? settings.soundEnabled,
-        soundFileId: editingMessage.soundFileId ?? "",
+        // soundEnabled: editingMessage.soundEnabled ?? settings.soundEnabled,
+        // soundFileId: editingMessage.soundFileId ?? "",
       }
     : {
-        soundEnabled: settings.soundEnabled,
+        // soundEnabled: settings.soundEnabled,
       };
 
   const handleSave = (payload: Parameters<typeof actions.createMessage>[0]) => {

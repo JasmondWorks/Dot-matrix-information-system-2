@@ -61,10 +61,10 @@ const TopBar = () => {
       </div>
       <div className="flex items-center gap-2 sm:gap-3">
         <div className="hidden min-w-[120px] flex-col text-xs text-muted-foreground sm:flex">
-          <div className="flex items-center gap-1 text-sm font-medium text-foreground">
+          {/* <div className="flex items-center gap-1 text-sm font-medium text-foreground">
             <BatteryIcon className="size-4" />
             {connected ? `${batteryPct}%` : "Power"}
-          </div>
+          </div> */}
           {device.currentMessageExcerpt ? (
             <span className="truncate text-xs">{device.currentMessageExcerpt}</span>
           ) : null}
